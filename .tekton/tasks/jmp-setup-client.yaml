@@ -1,0 +1,87 @@
+kind: Task
+apiVersion: tekton.dev/v1beta1
+metadata:
+  name: jmp-setup-client
+spec:
+  description: |
+    Create Jumpstarter client config from the user name provided in the parameters.
+  params:
+    - name: client-name
+      type: string
+      description: "The client intending to access Jumpstarter"
+      default: "default"
+    - name: namespace
+      type: string
+      description: "The namespace where the Jumpstarter server is running"
+      default: "auto-jumpstarter"
+
+  results:
+    - name: jmp-client-name
+      description: "The name of the Jumpstarter client"
+      type: string
+
+  steps:
+    - name: setup-client
+      image: ghcr.io/rhadp/pipeline:latest
+      env:
+      - name: JMP_GRPC_ENDPOINT
+        valueFrom:
+          configMapKeyRef:
+            name: jumpstarter-devspaces-config
+            key: JUMPSTARTER_GRPC_ENDPOINT
+
+      script: |
+        #!/usr/bin/env bash
+        set +eux
+
+        source /venv/bin/activate
+        cd /workspace/source
+
+        # Setup .kube correctly. Extract the values from the service account
+        POD_TOKEN_FILE="/var/run/secrets/kubernetes.io/serviceaccount/token"
+        POD_TOKEN=$(cat "$POD_TOKEN_FILE")
+        NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+        API_SERVER=$(oc whoami --show-server)
+
+        # set ./kube correctly
+        mkdir -p ~/.kube
+
+        oc config set-cluster rhas \
+          --server=$API_SERVER \
+          --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+        oc config set-credentials rhas-pac \
+          --token=$POD_TOKEN
+
+        oc config set-context rhas-pac-ctx \
+          --cluster=rhas \
+          --user=rhas-pac \
+          --namespace=$NAMESPACE
+
+        oc config use-context rhas-pac-ctx
+
+        # normalization for used in jumpstarter/kubernetes
+        CLIENT_NAME="$(echo $(params.client-name) | tr '[:upper:]' '[:lower:]' | sed 's/[^a-zA-Z0-9-]/-/g; s/-\+/-/g; s/^-//; s/-$//' | cut -c1-63)"
+        if oc get client "$CLIENT_NAME" -n $(params.namespace) &>/dev/null; then
+          oc delete client "$CLIENT_NAME" -n $(params.namespace) &>/dev/null || true
+        fi
+
+        # setup the jmp infrastructure
+        CONFIG_DIR="/opt/app-root/.config/jumpstarter/clients"
+        CONFIG_FILE="$CONFIG_DIR/$CLIENT_NAME.yaml"
+
+        # Create the config directory if it doesn't exist and write the config content to a file
+        mkdir -p "$CONFIG_DIR"
+
+        # create the client config
+        jmp admin create client $CLIENT_NAME --insecure-tls --unsafe --nointeractive -n $(params.namespace) --oidc-username keycloak:$(params.client-name) --out $CONFIG_FILE
+
+        # store the config in a secret
+        oc -n $NAMESPACE create secret generic $CLIENT_NAME --from-file config=$CONFIG_FILE
+
+        # output the client name to the results
+        echo -n $CLIENT_NAME > $(results.jmp-client-name.path)
+  
+  workspaces:
+    - name: source
+      description: The workspace where the source code is located

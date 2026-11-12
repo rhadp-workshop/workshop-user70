@@ -1,0 +1,32 @@
+kind: Task
+apiVersion: tekton.dev/v1beta1
+metadata:
+  name: bash
+spec:
+  description: |
+     Exceute bash commands in a container with the tools needed for RHAS development.
+  params:
+    - name: cmd
+      description: "Bash command to execute"
+      type: string
+    - name: image
+      type: string
+      description: "Container image to run. Use to provide own image with extensions"
+      default: "ghcr.io/rhadp/builder:latest"
+
+  steps:
+    - name: bash
+      image: "$(params.image)"
+      script: |
+        #!/usr/bin/env bash
+        set -x
+
+        source /venv/bin/activate
+        cd /workspace/source
+
+        echo "Executing bash command: '$(params.cmd)'"
+        eval "$(params.cmd)"
+
+  workspaces:
+    - name: source
+      description: The workspace where the source code is located

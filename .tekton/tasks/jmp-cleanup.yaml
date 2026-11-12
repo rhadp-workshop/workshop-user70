@@ -1,0 +1,99 @@
+kind: Task
+apiVersion: tekton.dev/v1beta1
+metadata:
+  name: jmp-cleanup
+spec:
+  description: |
+    Cleanup after using Jumpstarter and caib
+  params:
+    - name: client-name
+      type: string
+      description: "The jumpstarter client config"
+      default: "default"
+    - name: jmp-lease-id
+      type: string
+      description: "The lease ID to be released. Does nothing if not provided"
+      default: ""
+    - name: workspace
+      type: string
+      description: "The workspace to delete. Does nothing if not provided"
+      default: ""
+    - name: namespace
+      type: string
+      description: "The namespace where the Jumpstarter server is running"
+      default: "auto-jumpstarter"
+
+  steps:
+    - name: cleanup
+      image: ghcr.io/rhadp/pipeline:latest
+
+      script: |
+        #!/usr/bin/env bash
+        set +eux
+
+        source /venv/bin/activate
+        cd /workspace/source
+
+        # Setup .kube correctly. Extract the values from the service account
+        POD_TOKEN_FILE="/var/run/secrets/kubernetes.io/serviceaccount/token"
+        POD_TOKEN=$(cat "$POD_TOKEN_FILE")
+        NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+        API_SERVER=$(oc whoami --show-server)
+
+        # set ./kube correctly
+        mkdir -p ~/.kube
+
+        oc config set-cluster rhas \
+          --server=$API_SERVER \
+          --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+        oc config set-credentials rhas-pac \
+          --token=$POD_TOKEN
+
+        oc config set-context rhas-pac-ctx \
+          --cluster=rhas \
+          --user=rhas-pac \
+          --namespace=$NAMESPACE
+
+        oc config use-context rhas-pac-ctx
+
+        # Extract the values from the params
+        CLIENT_NAME=$(echo "$(params.client-name)" | tr -d '[:space:]')
+
+        # create the config loaction if it does not already exist
+        CONFIG_DIR="/opt/app-root/.config/jumpstarter/clients"
+        mkdir -p $CONFIG_DIR
+
+        # write the jumpstarter config to the expected location
+        echo "$(oc -n $NAMESPACE get secret $CLIENT_NAME -o jsonpath='{.data.config}' | base64 -d)" > "$CONFIG_DIR/$CLIENT_NAME.yaml"
+
+        # Use the client name provided in the parameter
+        jmp config client use $CLIENT_NAME
+
+        # Set the Jumpstarter environment variables
+        export JMP_CLIENT_CONFIG="$CONFIG_DIR/$CLIENT_NAME.yaml"
+        export JMP_LEASE="$(params.jmp-lease-id)"
+
+        WORKSPACE=$(echo "$(params.workspace)" | tr -d '[:space:]')
+        if [ -n "$WORKSPACE" ]; then
+          caib workspace delete $WORKSPACE
+        fi
+
+        # remove the lease if provided
+        if [ -n "$(params.jmp-lease-id)" ]; then
+          jmp delete leases $(params.jmp-lease-id)
+        fi
+
+        # remove the jumpstarter client from the namespace
+        if oc get client "$(params.client-name)" -n $(params.namespace) &>/dev/null; then
+          oc delete client "$(params.client-name)" -n $(params.namespace) &>/dev/null || true
+        fi
+
+        # remove the secret with the jumpstarter config
+        if oc get secret $CLIENT_NAME -n $NAMESPACE &>/dev/null; then
+          oc -n $NAMESPACE delete secret $CLIENT_NAME
+        fi
+
+  workspaces:
+    - name: source
+      description: The workspace where the source code is located

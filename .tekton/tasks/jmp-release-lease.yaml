@@ -1,0 +1,53 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: jmp-release-lease
+spec:
+  description: |
+    Release a lease acquired from Jumpstarter using the provided client name and lease ID.
+  params:
+    - name: client-name
+      type: string
+      description: "The jumpstarter client config"
+      default: "default"
+    - name: jmp-lease-id
+      type: string
+      description: "The lease ID to be released"
+  
+  steps:
+    - name: delete-lease
+      image: ghcr.io/rhadp/pipeline:latest 
+      args: ["$(params.exporter-labels[*])"]
+
+      script: |
+        #!/usr/bin/env bash
+        set +eux
+
+        source /venv/bin/activate
+        cd /workspace/source
+
+        # Extract the values from the service account and params
+        NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+        CLIENT_NAME=$(params.client-name)
+
+        # create the config loaction if it does not already exist
+        CONFIG_DIR="/opt/app-root/.config/jumpstarter/clients"
+        mkdir -p $CONFIG_DIR
+
+        # write the jumpstarter config to the expected location
+        echo "$(oc -n $NAMESPACE get secret $CLIENT_NAME -o jsonpath='{.data.config}' | base64 -d)" > "$CONFIG_DIR/$CLIENT_NAME.yaml"
+
+        # Use the client name provided in the parameter
+        jmp config client use $CLIENT_NAME
+
+        # Set the Jumpstarter environment variables
+        export JMP_CLIENT_CONFIG="$CONFIG_DIR/$CLIENT_NAME.yaml"
+        export JMP_LEASE="$(params.jmp-lease-id)"
+        
+        # Release the lease
+        echo "Deleting lease $(params.jmp-lease-id)"
+        jmp delete leases $(params.jmp-lease-id)
+  
+  workspaces:
+    - name: source
+      description: The workspace where the source code is located

@@ -1,0 +1,77 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: jmp-run-cmd
+spec:
+  description: |
+    Run a command
+  params:
+    - name: client-name
+      type: string
+      description: "The jumpstarter client config"
+      default: "default"
+    - name: jmp-lease-id
+      type: string
+      description: "The lease ID to use for command execution"
+    - name: jmp-cmd
+      type: string
+      description: "The commands to run"
+    - name: image
+      type: string
+      description: "Container image to run. Use to provide own image with extensions"
+      default: "ghcr.io/rhadp/pipeline:latest"
+  
+  steps:
+    - name: run-cmd
+      image: "$(params.image)"
+
+      script: |
+        #!/usr/bin/env bash
+        set +eux
+
+        source /venv/bin/activate
+        cd /workspace/source
+
+        # Tekton's creds-init auto-populates $HOME/.docker/config.json (and
+        # .dockercfg) with this Task's own ServiceAccount pull-secret creds
+        # for every registry host it knows about, including the internal
+        # OpenShift registry route. jumpstarter's OCI credential resolution
+        # (used by e.g. `j flasher flash oci://...`) treats that file as a
+        # client-side auth-file fallback and forwards the credentials it
+        # finds to the exporter, which takes them over the exporter's own
+        # scoped OCI_USERNAME/OCI_PASSWORD_FILE credentials. That silently
+        # swaps in this pipeline's own SA identity - which typically has no
+        # pull access to the namespace the image was built in - causing
+        # 401 Unauthorized even though the exporter is correctly configured.
+        # Point HOME elsewhere so no such auth file is found and the
+        # exporter's own credentials are used instead.
+        export HOME="$(mktemp -d)"
+
+        # Extract the values from the service account and params
+        NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+        CLIENT_NAME=$(params.client-name)
+
+        # create the config loaction if it does not already exist
+        CONFIG_DIR="/opt/app-root/.config/jumpstarter/clients"
+        mkdir -p $CONFIG_DIR
+
+        # write the jumpstarter config to the expected location
+        echo "$(oc -n $NAMESPACE get secret $CLIENT_NAME -o jsonpath='{.data.config}' | base64 -d)" > "$CONFIG_DIR/$CLIENT_NAME.yaml"
+
+        # Use the client name provided in the parameter
+        jmp config client use $CLIENT_NAME
+
+        # Set the Jumpstarter environment variables
+        export JMP_CLIENT_CONFIG="$CONFIG_DIR/$CLIENT_NAME.yaml"
+        export JMP_LEASE="$(params.jmp-lease-id)"
+        
+        # Run the command
+        echo "Running cmd $(params.jmp-cmd)"
+        
+        jmp shell --lease "${JMP_LEASE}" <<-EOF
+          $(params.jmp-cmd)
+        EOF
+  
+  workspaces:
+    - name: source
+      description: The workspace where the source code is located

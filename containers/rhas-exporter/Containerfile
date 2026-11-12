@@ -1,0 +1,89 @@
+FROM ghcr.io/rhadp/runtime:latest
+# see https://github.com/rhadp/containers/blob/main/containers/runtime/Containerfile
+
+USER root
+
+ARG TARGETARCH
+
+# define some environment variables
+ENV ARCH=${TARGETARCH:-arm64} \
+    HOME=/opt/app-root/src \
+    APP_ROOT=/opt/app-root \
+    XDG_CONFIG_HOME=/opt/app-root/.config \
+    PATH=/opt/app-root/src/bin:/opt/app-root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# set the virtual environment for jumpstarter etc
+ENV UV_PYTHON=python3.14 VIRTUAL_ENV=/venv
+
+# repo/ref providing the rhas-driver-* packages (local forks of jumpstarter drivers)
+ENV JUMPSTARTER_REPO=https://github.com/mickume/jumpstarter \
+    JUMPSTARTER_VERSION=develop \
+    RHAS_STARTER_REPO=https://github.com/rhadp-examples/rhas-starter \
+    RHAS_STARTER_VERSION=main
+
+# install basic packages & virtualization packages
+ARG CENTOS_STREAM_VERSION=10.0-23.el10 \
+    FLASHER_VERSION=0.3.0
+
+# UBI10 doesn't ship qemu-kvm/libvirt/the @virtualization-* groups, and this
+# build environment has no RHEL entitlement (subscription-manager) to reach
+# the real RHEL AppStream repos for them. Pull in the matching CentOS
+# Stream 10 repos instead: CentOS Stream is upstream of RHEL 10, so its
+# BaseOS/AppStream package and group definitions line up with what an
+# entitled RHEL host would otherwise provide. EPEL is already enabled by
+# the base ghcr.io/rhadp/runtime image, so it isn't touched here.
+RUN if [ "$ARCH" = "arm64" ]; then \
+        CENTOS_ARCH=aarch64; \
+    else \
+        CENTOS_ARCH=x86_64; \
+    fi && \
+    dnf install -y --setopt=tsflags=nodocs \
+        "https://mirror.stream.centos.org/10-stream/BaseOS/${CENTOS_ARCH}/os/Packages/centos-stream-repos-${CENTOS_STREAM_VERSION}.noarch.rpm" \
+        "https://mirror.stream.centos.org/10-stream/BaseOS/${CENTOS_ARCH}/os/Packages/centos-gpg-keys-${CENTOS_STREAM_VERSION}.noarch.rpm"
+
+RUN dnf install -y --setopt=tsflags=nodocs \
+    stow qemu-kvm qemu-img libvirt \
+    "@virtualization-hypervisor" "@virtualization-client" "@virtualization-platform" "@virtualization-tools" \
+    virt-install virt-viewer \
+    genisoimage \
+    swtpm swtpm-tools tpm2-tools && \
+    dnf -y clean all --enablerepo='*' && \
+    rm -rf /var/cache/dnf
+
+# install swtpm
+# entrypoint.sh only runs `swtpm socket`, so only the tpmstate dir is
+# needed. /var/lib/swtpm-localca is intentionally left out since nothing
+# here calls swtpm_setup/swtpm_cert to provision a local CA; add it back
+# (with the same chgrp/chmod treatment) if EK/platform cert provisioning
+# is introduced later.
+RUN mkdir -p /tmp/swtpm && \
+    chgrp -R 0 /tmp/swtpm && \
+    chmod -R g=u /tmp/swtpm
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Install the rhas driver packages (local forks of jumpstarter drivers) directly from GitHub, and any other patches to Jumpstarter
+RUN uv venv --clear /venv && \
+    uv pip install "git+${JUMPSTARTER_REPO}@${JUMPSTARTER_VERSION}#subdirectory=python/packages/jumpstarter-all" \
+        "git+${RHAS_STARTER_REPO}@${RHAS_STARTER_VERSION}#subdirectory=packages/rhas-driver-qemu" \
+        "git+${RHAS_STARTER_REPO}@${RHAS_STARTER_VERSION}#subdirectory=packages/rhas-driver-opendal" \
+        "git+${RHAS_STARTER_REPO}@${RHAS_STARTER_VERSION}#subdirectory=packages/rhas-driver-power"
+
+# install the Fast Flash Tool https://github.com/jumpstarter-dev/fls
+RUN if [ "$ARCH" = "arm64" ]; then \
+        curl -L https://github.com/jumpstarter-dev/fls/releases/download/${FLASHER_VERSION}/fls-aarch64-linux-musl -o /usr/local/bin/fls; \
+    else \
+        curl -L https://github.com/jumpstarter-dev/fls/releases/download/${FLASHER_VERSION}/fls-x86_64-linux -o /usr/local/bin/fls; \
+    fi  && \
+    chmod +x /usr/local/bin/fls
+
+WORKDIR ${HOME}
+
+# A last pass to make sure that an arbitrary user can write in $HOME
+RUN chgrp -R 0 /home && chmod -R g=u /home
+
+USER 1001
+
+ENV TPM2TOOLS_TCTI="swtpm:host=127.0.0.1,port=2321"
+ENTRYPOINT ["entrypoint.sh"]
+CMD ["tail", "-f", "/dev/null"]

@@ -1,0 +1,75 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: jmp-get-lease
+spec:
+  description: |
+    Acquire a lease from Jumpstarter using the provided client name and labels.
+  params:
+    - name: client-name
+      type: string
+      description: "The jumpstarter client config"
+      default: "default"
+    - name: exporter-labels
+      type: array
+      description: "A list of label exporters in the format key=value"
+    - name: timeout
+      type: string
+      description: "Maximum wait time (in seconds) for lease acquisition before timeout"
+      default: '3600'
+    - name: lease-duration
+      type: string
+      description: "Maximum time (in HH:MM:SS format) for holding lease before relasing it"
+      default: '02:00:00'
+
+  results:
+    - description: The Lease ID from Jumpstarter
+      name: jmp-lease-id
+      type: string
+  
+  steps:
+    - name: get-lease
+      image: ghcr.io/rhadp/pipeline:latest
+      args: ["$(params.exporter-labels[*])"]
+
+      script: |
+        #!/usr/bin/env bash
+        set +eux
+
+        source /venv/bin/activate
+        cd /workspace/source
+
+        # Extract the values from the service account and params
+        NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+        CLIENT_NAME=$(params.client-name)
+
+        # create the config loaction if it does not already exist
+        CONFIG_DIR="/opt/app-root/.config/jumpstarter/clients"
+        mkdir -p $CONFIG_DIR
+
+        # write the jumpstarter config to the expected location
+        echo "$(oc -n $NAMESPACE get secret $CLIENT_NAME -o jsonpath='{.data.config}' | base64 -d)" > "$CONFIG_DIR/$CLIENT_NAME.yaml"
+
+        # Use the client name provided in the parameter
+        jmp config client use $CLIENT_NAME
+
+        # Set the Jumpstarter environment variables
+        export JMP_CLIENT_CONFIG="$CONFIG_DIR/$CLIENT_NAME.yaml"
+
+        # Loop through each label provided as argument and build 
+        CLIENT_LEASE_CMD="jmp create lease"
+        for label in "$@"; do
+          IFS='=' read -r KEY VAL <<< "$label"
+          CLIENT_LEASE_CMD+=" -l $KEY=$VAL"
+        done
+
+        # Request a lease
+        JMP_LEASE_ID=$(timeout "$(params.timeout)" $CLIENT_LEASE_CMD --duration "$(params.lease-duration)" -o name) 
+
+        echo "Aquired lease $JMP_LEASE_ID for client $CLIENT_NAME"
+        # Output the lease ID to the Tekton results
+        echo -n "$JMP_LEASE_ID" > $(results.jmp-lease-id.path)
+  
+  workspaces:
+    - name: source
+      description: The workspace where the source code is located

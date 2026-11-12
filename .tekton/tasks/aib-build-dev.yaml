@@ -1,0 +1,122 @@
+kind: Task
+apiVersion: tekton.dev/v1beta1
+metadata:
+  name: aib-build-dev
+spec:
+  description: |
+     Build a disk image using ostree or package-based mode for development workflows.
+  params:
+    - name: client-name
+      type: string
+      description: "The jumpstarter client config"
+      default: "default"
+    - name: build-name
+      type: string
+      description: "The build name to use for the asset creation"
+    - name: manifest
+      type: string
+      description: "The manifest.aib.yml to build"
+    - name: workspace
+      type: string
+      default: ""
+    - name: target
+      type: string
+      description: "Target platform"
+      default: "qemu"
+    - name: architecture
+      type: string
+      description: "Architecture (amd64, arm64)"
+      default: "arm64"
+    - name: mode
+      type: string
+      description: "Build mode: image (ostree) or package (package-based)"
+      default: "image"
+    - name: format
+      type: string
+      description: "Export format: qcow2, raw, simg, etc"
+      default: "qcow2"
+    - name: extra-args
+      description: "Additional args to add to the build parameters"
+      type: string
+      default: ""
+
+  results:
+    - name: build-result
+      description: "aib results as json string"
+      type: string
+    - name: build-name
+      type: string
+    - name: build-phase
+      type: string
+    - name: build-message
+      type: string
+    - name: disk-image
+      type: string
+    - name: registry-user
+      type: string
+    - name: registry-token
+      type: string
+
+  steps:
+    - name: build
+      image: ghcr.io/rhadp/builder:latest
+      script: |
+        #!/usr/bin/env bash
+        set +eux
+
+        source /venv/bin/activate
+        cd /workspace/source
+
+        # Extract the values from the service account and params
+        NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+        CLIENT_NAME=$(params.client-name)
+
+        # create the config loaction if it does not already exist
+        CONFIG_DIR="/opt/app-root/.config/jumpstarter/clients"
+        mkdir -p $CONFIG_DIR
+
+        # write the jumpstarter config to the expected location
+        echo "$(oc -n $NAMESPACE get secret $CLIENT_NAME -o jsonpath='{.data.config}' | base64 -d)" > "$CONFIG_DIR/$CLIENT_NAME.yaml"
+
+        # Use the client name provided in the parameter
+        jmp config client use $CLIENT_NAME
+
+        # Set the Jumpstarter environment variables
+        export JMP_CLIENT_CONFIG="$CONFIG_DIR/$CLIENT_NAME.yaml"
+
+        WORKSPACE=$(params.workspace)
+        if [ -n "$WORKSPACE" ]; then
+          WORKSPACE="--workspace $WORKSPACE"
+        fi
+
+        BUILD_PARAMS="image build-dev $(params.manifest) -n $(params.build-name) --internal-registry $WORKSPACE --target $(params.target) --arch $(params.architecture) --mode $(params.mode) --format $(params.format) $(params.extra-args) --quiet --output-format json"
+        echo "caib $BUILD_PARAMS"
+        caib $BUILD_PARAMS > /tmp/aib.json
+        CAIB_EXIT_CODE=$?
+
+        if [ $CAIB_EXIT_CODE -ne 0 ]; then
+          echo "caib command failed with exit code $CAIB_EXIT_CODE"
+          cat /tmp/aib.json
+          exit $CAIB_EXIT_CODE
+        fi
+
+        # extract the values
+        DISK_IMAGE=$(jq -r '.diskImage' /tmp/aib.json)
+        REGISTRY_USER=$(jq -r '.registryUsername' /tmp/aib.json)
+        REGISTRY_TOKEN=$(jq -r '.registryToken' /tmp/aib.json)
+        BUILD_NAME=$(jq -r '.name' /tmp/aib.json)
+        BUILD_PHASE=$(jq -r '.phase' /tmp/aib.json)
+        BUILD_MESSAGE=$(jq -r '.message' /tmp/aib.json)
+
+        # return the build results
+        cat /tmp/aib.json > $(results.build-result.path)
+        echo -n $BUILD_NAME > $(results.build-name.path)
+        echo -n $BUILD_PHASE > $(results.build-phase.path)
+        echo -n $BUILD_MESSAGE > $(results.build-message.path)
+        echo -n $DISK_IMAGE > $(results.disk-image.path)
+        echo -n $REGISTRY_USER > $(results.registry-user.path)
+        echo -n $REGISTRY_TOKEN > $(results.registry-token.path)
+
+  workspaces:
+    - name: source
+      description: The workspace where the source code is located
